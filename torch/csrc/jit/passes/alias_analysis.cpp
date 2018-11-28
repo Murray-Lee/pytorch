@@ -18,9 +18,46 @@ bool shouldAnnotate(TypePtr type) {
 bool shouldAnnotate(const Value* v) {
   return shouldAnnotate(v->type());
 }
+
 } // namespace
 
+AliasDb::AliasDb(std::shared_ptr<Graph> graph) : graph_(graph) {
+  analyze(graph_);
+
+  // Build helper indices
+  // NOTE: that these assume that AliasDb is immutable once constructed.
+  // - Alias set -> value mapping
+  for (const auto& pr : valueToAlias_) {
+    const auto value = pr.first;
+    const auto& aliasInfo = pr.second;
+    // We don't support composite types yet
+    JIT_ASSERT(aliasInfo.containedTypes().size() == 0);
+    for (const auto aliasSet : aliasInfo.sets()) {
+      aliasToValue_[aliasSet].insert(value);
+    }
+  }
+  // - Set of all nodes with a wildcard
+  buildWildcardIndex(graph->block());
+}
+
+void AliasDb::buildWildcardIndex(const Block* b) {
+  for (const auto node : b->nodes()) {
+    for (const auto block : node->blocks()) {
+      buildWildcardIndex(block);
+    }
+
+    if (hasWildcard(node)) {
+      wildcardNodes_.insert(node);
+    }
+  }
+}
+
 bool AliasDb::hasWildcard(const Node* n) const {
+  return wildcardNodes_.count(n) != 0;
+}
+
+// Does `n` use or write to any wildcard aliases?
+bool AliasDb::hasWildcardImpl(const Node* n) const {
   for (const auto input : n->inputs()) {
     if (valueToAlias_.count(input) != 0 &&
         valueToAlias_.at(input).isWildcard()) {
@@ -66,6 +103,66 @@ bool AliasDb::hasWrites(Node* n) const {
   }
   for (const auto output : n->outputs()) {
     if (writesTo(n, output)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool AliasDb::hasLiveWrites(Node* n) const {
+  std::vector<const Value*> writes;
+  for (const auto input : n->inputs()) {
+    if (writesTo(n, input)) {
+      writes.push_back(input);
+    }
+  }
+  for (const auto output : n->outputs()) {
+    if (writesTo(n, output)) {
+      writes.push_back(output);
+    }
+  }
+
+  // For all writes, check if there is any use after `n`
+  return std::any_of(writes.cbegin(), writes.cend(), [&](const Value* v) {
+    const auto& aliasInfo = valueToAlias_.at(v);
+    const auto& aliasSets = aliasInfo.sets();
+
+    // Check every distinct alias set this value belongs to
+    return std::any_of(
+        aliasSets.cbegin(), aliasSets.cend(), [&](const Symbol aliasSet) {
+          return hasUsesAfter(aliasSet, n);
+        });
+  });
+}
+
+// Returns true if there is a use of this alias set in the graph after `n`
+//
+// For wildcards: if there are any wildcards after `n`, we consider the alias
+// to be used.
+bool AliasDb::hasUsesAfter(Symbol alias, const Node* n) const {
+  if (graphInputAliases_.count(alias) != 0) {
+    // We must always consider graph input aliases to have future uses, since
+    // they may be used outside the graph.
+    return true;
+  }
+
+  const auto& values = aliasToValue_.at(alias);
+  for (const auto value : values) {
+    for (const auto& use : value->uses()) {
+      const auto& user = use.user;
+      if (user->owningGraph() != n->owningGraph()) {
+        // TODO(suo): We need this because alias analysis looks at subgraphs
+        // but isAfter() does not. Just be safe and say there is a use.
+        return true;
+      }
+      if (user->isAfter(n)) {
+        return true;
+      }
+    }
+  }
+
+  for (const auto wildcardNode : wildcardNodes_) {
+    if (wildcardNode->isAfter(n)) {
       return true;
     }
   }
@@ -138,7 +235,7 @@ void AliasDb::dump() const {
 void AliasDb::analyze(std::shared_ptr<Graph> graph) {
   // Assign aliases to the graph's inputs, assuming that all inputs of a given
   // type may alias to each other.
-  const auto tensorAlias = getFreshAlias();
+  const auto tensorAlias = getFreshAlias(/*isGraphInput=*/true);
   // Create a separate alias set for each list type
   std::map<TypeKind, Symbol> listTypeAliases;
   // Create a separate alias set for each tuple type
@@ -162,14 +259,15 @@ void AliasDb::analyze(std::shared_ptr<Graph> graph) {
         containedType = DynamicType::get();
       }
       if (listTypeAliases.count(containedType->kind()) == 0) {
-        listTypeAliases[containedType->kind()] = getFreshAlias();
+        listTypeAliases[containedType->kind()] =
+            getFreshAlias(/*isGraphInput=*/true);
       }
 
       addAlias(input, listTypeAliases.at(containedType->kind()));
     } else if (inputType->kind() == TypeKind::TupleType) {
       auto tupleType = inputType->cast<TupleType>();
       if (tupleTypeAliases.count(tupleType) == 0) {
-        tupleTypeAliases[tupleType] = getFreshAlias();
+        tupleTypeAliases[tupleType] = getFreshAlias(/*isGraphInput=*/true);
       }
       addAlias(input, tupleTypeAliases.at(tupleType));
     } else {
@@ -380,7 +478,13 @@ void AliasDb::analyzeSubgraph(Node* node) {
 
   analyze(subgraphBlock);
 
-  mapAliases(node->outputs(), subgraphBlock->outputs());
+  // TODO(suo): the subgraph outputs and node outputs are NOT NECESSARILY the
+  // same length. Autodifferentiation maybe capture additional outputs in the
+  // subgraph block.
+  JIT_ASSERT(subgraphBlock->outputs().size() >= node->outputs().size());
+  for (size_t i = 0; i < node->outputs().size(); i++) {
+    addAlias(node->outputs()[i], subgraphBlock->outputs()[i]);
+  }
 }
 
 // For nodes that generate a fresh value from nothing
@@ -423,9 +527,12 @@ void AliasDb::analyzeBroadcastingChunk(Node* node) {
   }
 }
 
-Symbol AliasDb::getFreshAlias() const {
+Symbol AliasDb::getFreshAlias(bool isGraphInput) {
   auto num = std::stoll(latestSymbol_.toUnqualString());
   latestSymbol_ = Symbol::fromQualString("alias::" + std::to_string(++num));
+  if (isGraphInput) {
+    graphInputAliases_.insert(latestSymbol_);
+  }
   return latestSymbol_;
 }
 

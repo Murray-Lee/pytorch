@@ -870,8 +870,6 @@ bool Node::isBefore(const Node * n) const {
 }
 
 bool Node::isAfter(const Node * n) const {
-  JIT_ASSERT(this->owningGraph() == n->owningGraph());
-
   if (this->owningBlock() == n->owningBlock()) {
     return this->topo_position_ > n->topo_position_;
   }
