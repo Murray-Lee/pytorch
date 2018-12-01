@@ -264,6 +264,8 @@ class JitTestCase(TestCase):
 
             pp2, _ = sm._python_print()
             if pp != pp2:
+                print(pp)
+                print(pp2)
                 self.assertMultiLineEqual(pp, pp2)
 
     def getExportImportCopy(self, m, also_test_file=True):
@@ -8863,6 +8865,52 @@ a")
             return _infer_size(x.size(), y.size())
 
         self.checkScript(fn, (torch.ones(2, 4, 2), torch.ones(2, 4, 2)))
+
+    def test_mutable_dce(self):
+        @torch.jit.script
+        def foo():
+            a = torch.rand(2, 3)
+            a += torch.rand(2, 3)
+            b = torch.rand(2, 3)
+            b += torch.rand(2, 3)
+            # b should be cleaned up but not a
+            return a
+
+        self.assertExpectedGraph(foo.graph)
+
+    def test_mutable_dce_block(self):
+        @torch.jit.script
+        def foo():
+            a = torch.rand(2, 3)
+            a += torch.rand(2, 3)
+            b = torch.rand(2, 3)
+            if bool(a > torch.zeros(2, 3)):
+                b += torch.rand(2, 3)
+                a += torch.rand(2, 3)
+            # a should be cleaned up but not b
+            return b
+
+        self.assertExpectedGraph(foo.graph)
+
+    def test_mutable_dce_graph_input(self):
+        @torch.jit.script
+        def foo(a):
+            a += torch.rand(2, 3)
+            # shouldn't clean up `a` even though it's not used in the output
+
+        self.assertExpectedGraph(foo.graph)
+
+    def test_mutable_dce_list(self):
+        @torch.jit.script
+        def foo(a):
+            l = []
+            l.append(a)
+            c = l[0]
+            b = torch.rand(2, 3)
+            c += torch.rand(2, 3)
+            return b
+
+        self.assertExpectedGraph(foo.graph)
 
 
 class MnistNet(nn.Module):

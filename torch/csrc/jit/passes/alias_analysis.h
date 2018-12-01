@@ -31,8 +31,15 @@ class AliasDb {
   // Does `n` use or write to any wildcard aliases?
   bool hasWildcard(const Node* n) const;
 
+  const std::unordered_set<const Node*>& getWildcardNodes() const {
+    return wildcardNodes_;
+  }
+
   // Does `n` write to any alias sets?
   bool hasWrites(Node* n) const;
+
+  // Does `n` write to a value that may alias one of the graph inputs?
+  bool writesToInputAlias(Node* n) const;
 
   // Get all nodes that write to any alias set inputed/outputed by `n`
   std::unordered_set<Node*> getWritersForNode(const Node* n) const;
@@ -41,10 +48,6 @@ class AliasDb {
   bool hasWriters(const Node* n) const {
     return getWritersForNode(n).size() != 0;
   }
-
-  // Returns true if any values that `n` writes to are used after `n`, either
-  // directly or through an alias.
-  bool hasLiveWrites(Node* n) const;
 
   // For debugging: print alias db state to stdout
   void dump() const;
